@@ -1,0 +1,154 @@
+- name: Setup Proxmox VM
+  hosts: localhost
+  become: true
+  vars_prompt:
+    - name: "proxmox_host"
+      prompt: "Введите IP-адрес или имя хоста Proxmox"
+      private: false
+
+    - name: "proxmox_user"
+      prompt: "Введите имя пользователя Proxmox"
+      private: false
+
+    - name: "proxmox_password"
+      prompt: "Введите пароль Proxmox"
+      private: true
+
+    - name: "vm_count"
+      prompt: "Сколько виртуальных машин вы хотите создать?"
+      private: false
+
+    - name: "ip_base"
+      prompt: "Введите базовый IP-адрес (пример, точка в конце обязательна 192.168.10.)"
+      private: false
+
+    - name: "ip_start"
+      prompt: "Введите начальный номер IP (например, 100)"
+      private: false
+
+    - name: "net_mask"
+      prompt: "Введите маску сети (например, 24)"
+      private: false
+
+    - name: "gateway_ip"
+      prompt: "Введите IP-адрес шлюза"
+      private: false
+
+    - name: "vlan_id"
+      prompt: "Введите идентификатор VLAN (оставьте пустым, если VLAN не используется)"
+      private: false
+
+    - name: "template_id"
+      prompt: "Введите ID шаблона (если шаблон отсутствует то он создастся)"
+      private: false
+
+    - name: "net_bridge"
+      prompt: "Enter the network bridge (e.g., vmbr0)"
+      private: false
+
+    - name: "vm_start_id"
+      prompt: "Введите начальный ID VM (будет найден следующий свободный идентификатор, если он занят)"
+      private: false
+
+    - name: "vm_username"
+      prompt: "Введите логин новой VM(можно пропустить создаться пользователь root)"
+      private: false
+      default: "root"
+
+    - name: "vm_password"
+      prompt: "Введите пароль от новой VM"
+      private: true
+
+  tasks:
+    - name: Add Proxmox host to inventory
+      add_host:
+        name: "{{ proxmox_host }}"
+        groups: proxmox
+        ansible_user: "{{ proxmox_user }}"
+        ansible_password: "{{ proxmox_password }}"
+        ansible_connection: ssh
+
+    - name: Find next available VM ID
+      ansible.builtin.shell: |
+        id={{ vm_start_id }}
+        while qm list | awk '{print $1}' | grep -qw $id; do
+          id=$((id + 1))
+        done
+        echo $id
+      delegate_to: "{{ proxmox_host }}"
+      register: next_vm_id
+
+    - name: Check if template exists
+      ansible.builtin.shell: |
+        qm list | awk '{print $1}' | grep -w {{ template_id }}
+      register: template_check
+      delegate_to: "{{ proxmox_host }}"
+      ignore_errors: true
+
+    - name: Download Ubuntu Cloud Image
+      ansible.builtin.shell: |
+        wget -c http://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+      args:
+        chdir: /root
+      when: template_check.stdout == ""
+
+    - name: Create template virtual machine
+      ansible.builtin.shell: |
+        /usr/sbin/qm create {{ template_id }} --name "ubuntu-noble-template" --memory 2048 --cores 2 --net0 virtio,bridge={{ net_bridge }}
+      delegate_to: "{{ proxmox_host }}"
+      args:
+        chdir: /root
+      when: template_check.stdout == ""
+
+    - name: Import disk to local-lvm
+      ansible.builtin.shell: |
+        qm importdisk {{ template_id }} noble-server-cloudimg-amd64.img local-lvm
+      delegate_to: "{{ proxmox_host }}"
+      args:
+        chdir: /root
+      when: template_check.stdout == ""
+
+    - name: Configure VM hardware and cloud-init
+      ansible.builtin.shell: |
+        qm set {{ template_id }} --scsihw virtio-scsi-pci --scsi0 local-lvm:vm-{{ template_id }}-disk-0
+        qm set {{ template_id }} --ide2 local-lvm:cloudinit
+        qm set {{ template_id }} --boot c --bootdisk scsi0
+        qm set {{ template_id }} --serial0 socket --vga serial0
+        qm set {{ template_id }} --sshkey /root/sshkey.txt
+        qm set {{ template_id }} --agent enabled=1
+      delegate_to: "{{ proxmox_host }}"
+      when: template_check.stdout == ""
+
+    - name: Set VM login credentials
+      ansible.builtin.shell: |
+        qm set {{ template_id }} --ciuser {{ vm_username }} --cipassword {{ vm_password }}
+      delegate_to: "{{ proxmox_host }}"
+      args:
+        executable: /bin/bash
+
+    - name: Convert to template
+      ansible.builtin.shell: |
+        qm template {{ template_id }}
+      delegate_to: "{{ proxmox_host }}"
+      when: template_check.stdout == ""
+
+    - name: Create and configure VMs
+      ansible.builtin.shell: |
+        for i in $(seq 0 $(( {{ vm_count }} - 1 ))); do
+          vm_id=$(( {{ next_vm_id.stdout }} + i ))
+          vm_ip={{ ip_base }}$(( {{ ip_start | int }} + i ))
+
+          qm clone {{ template_id }} $vm_id --name vm-$vm_id --full
+
+          if [ -n "{{ vlan_id }}" ]; then
+            qm set $vm_id --net0 virtio,bridge={{ net_bridge }},tag={{ vlan_id }}
+          else
+            qm set $vm_id --net0 virtio,bridge={{ net_bridge }}
+          fi
+
+          qm set $vm_id --ipconfig0 ip=$vm_ip/{{ net_mask }},gw={{ gateway_ip }}
+          qm start $vm_id
+        done
+      delegate_to: "{{ proxmox_host }}"
+      args:
+        executable: /bin/bash
